@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# 秘密・ローカル設定（公開リポジトリに入れない）
+.env
+*.env
+secrets.*
+mask_local.py          # 実値の辞書・SALT を置く場合はこの名前でローカル管理

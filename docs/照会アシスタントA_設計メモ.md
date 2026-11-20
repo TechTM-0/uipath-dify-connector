@@ -1,0 +1,678 @@
+# UiPath OC チャットアシスタント 設計メモ — 照会アシスタント A
+
+> 対象: Dify チャットフローで UiPath Orchestrator (OC) の情報を扱うチャットアシスタント
+> 本書の範囲: **A（照会アシスタント）**。B（障害調査/RAG）は将来。
+> 作成日: 2026-11-19 / 更新日: 2026-11-20（**実ツール仕様を反映**: `search_logs` / `analyze_historical_logs`、`search_jobs` は `filters[]`） / モデル前提: Gemini（セルフホスト Dify）
+
+---
+
+## 目次
+
+- [0. この文書について](#0-この文書について)
+- [1. 設計の背骨（A/B 分離と原則）](#1-設計の背骨ab-分離と原則)
+- [2. MCP ツール設計](#2-mcp-ツール設計)
+- [3. Dify チャットフロー設計](#3-dify-チャットフロー設計)
+- [4. 分類器（intent）設計](#4-分類器intent設計)
+- [5. 会話状態と多ターン](#5-会話状態と多ターン)
+- [6. 実装の進め方（順番）](#6-実装の進め方順番)
+- [7. 未決事項 / TODO](#7-未決事項--todo)
+- [8. 付録：B（将来）への布石](#8-付録b将来への布石)
+- [9. 実装レディネス（ギャップ分析）](#9-実装レディネスギャップ分析)
+
+---
+
+## 0. この文書について
+
+UiPath OC を操作する MCP ツール（ジョブ検索・ログ取得・過去ログ横断検索）を、Dify のチャットフローから安定して使うための設計メモ。
+
+一番の課題は **「ユーザーの質問に対して、どのツールをどう実行するかの判断を LLM にうまくさせられない」** こと。本書の設計は一貫して次の方針で解く:
+
+> **LLM に判断させる範囲を最小化し、決まりきった処理はフロー／ツール側に固定する。**
+
+---
+
+## 1. 設計の背骨（A/B 分離と原則）
+
+### 1.1 A と B は別の生き物
+
+| | A：照会アシスタント（本書） | B：障害調査（将来） |
+|---|---|---|
+| 本質 | データを**引く** (lookup) | **考えて結論を出す** (reasoning) |
+| 手数 | 1〜数回叩いて返す | 複数ソースを集めて多段推論 |
+| 状態 | ほぼステートレス | ステートフル |
+| 速度/コスト | 速い・安い | 遅い・高い |
+| きっかけ | ユーザーの質問 | 質問 or **ジョブ失敗イベント** |
+| 記憶 | 不要〜軽い | RAG / エラーパターン辞書 |
+
+**この2つを1つのチャットフロー／Agent に同居させると、LLM が毎ターン「窓口なのか調査官なのか」を切り替えさせられ、判断が鈍る。** だから物理的に分ける。
+
+### 1.2 A と B の境界線
+
+「難しさ」で分けると曖昧になる。**「答えを出すのに、今 OC から取れるデータ以外のものが要るか？」** で切る。
+
+| 必要なもの | 分類 | 例 |
+|---|---|---|
+| OC から取れるデータ**だけ**で完結 | **A** | ジョブ一覧、ログ、エラー傾向・失敗率・多い時間帯 |
+| 過去事例・ナレッジ・**因果の仮説**が要る | **B** | 「なぜ落ちた？」「どう直す？」「前も同じ事あった？」 |
+
+覚え方（5W1H）:
+
+- **A** = What / When / Which / How many（事実と集計）
+- **B** = Why / How to fix（原因と対応）
+
+**リトマス試験**: 機能を足すとき毎回これを当てる。
+
+> この答え、**OC から今取れるデータだけで出せる？** → YES は A / NO は B
+
+### 1.3 全体アーキテクチャ
+
+```mermaid
+flowchart TD
+  subgraph SHARED["共有: MCP ツール層（UiPath OC）"]
+    T1["search_jobs"]
+    T2["search_logs"]
+    T3["analyze_historical_logs"]
+  end
+  subgraph A["A: 照会アシスタント（本書）"]
+    A1["分類 → 分岐 → ツール → 整形"]
+  end
+  subgraph B["B: 障害調査エージェント（将来）"]
+    B1["Runbook + RAG + 強モデル"]
+  end
+  TRIG["ジョブ失敗イベント"] -.-> B
+  A1 --> SHARED
+  B1 -.-> SHARED
+  A1 -. 調査を引き渡し .-> B1
+```
+
+- **MCP 層は1つの共有基盤**。A でも B でも、将来 Python からでも同じツールを使える（＝これが MCP の価値）
+- A は軽い窓口（Gemini で十分）、B は重くて賢い（速さ制約から解放）
+- A のツールは将来の B の部品として再利用できる（特に `analyze_historical_logs`）
+
+### 1.4 貫く設計原則
+
+1. **LLM の判断を最小化する** — 選択肢を増やさない
+2. **既知の依存は固定配線** — ツール連鎖を LLM に判断させない
+3. **選択は Code（ルール）に寄せる** — 「最新を選ぶ」等は LLM でなくコード
+4. **判断はサーバ、UX はホスト** — 何を返すかはツール、聞き返し方はフロー
+5. **公開はタスク単位** — ユーザーのやりたいこと単位でツールを使う
+6. **データで閉じるのが A、知識が要るのが B**
+7. **特定(identify)と取得(fetch)を分ける** — 「どのジョブか」を決めてから、その1件を取る。推測で代用しない
+
+---
+
+## 2. MCP ツール設計
+
+### 2.1 実ツール（MCP が公開する3つ）
+
+| ツール | 役割 | 件数 |
+|---|---|---|
+| `search_jobs` | ジョブ検索・特定 | 一覧 |
+| `search_logs` | **特定1ジョブ**のログ取得（＋ジョブ内キーワード検索） | 単一ジョブ |
+| `analyze_historical_logs` | 過去ジョブの**横断**検索（重い） | 複数ジョブ |
+
+> **設計上の対応**：`search_jobs`＝「特定(identify)」、`search_logs(job_key)`＝「取得(fetch)」、`analyze_historical_logs`＝「横断」。
+> ※ 旧メモの `get_logs`→実体は **`search_logs`**、`cross_log`→実体は **`analyze_historical_logs`**。
+
+**出力フィールド（実際）**:
+
+- `search_jobs` → Job: **JobKey / State / CreationTime / プロセス名(ReleaseName)** など
+- `search_logs` → その1ジョブの RobotLogs: **Message / RawMessage / Level / Timestamp** など
+- `analyze_historical_logs` → 対象ジョブ件数 / 一致ログ件数 / RobotLogs / `job_search_truncated` / `truncated_job_count`
+
+> **スコープ（フォルダ）**：MCP は**固定の単一フォルダ（`default`）**に対して操作する（OC クライアントに tenant / folder / user / password を設定）。**複数フォルダ・横断は v1 では非対象**（必要になれば MCP 側にフォルダ指定を足す将来課題）。よって **A のフロー側はフォルダを意識しない**。
+
+### 2.2 search_jobs は「filters 配列」で絞る（重要）
+
+search_jobs は process/status/time を**個別引数で受けない**。**OData 風の `filters[]`** で受ける:
+
+```
+filters[] の各要素: { field, operator, value }
+  field    : State | CreationTime | ReleaseName
+  operator : eq | ge | le
+  value    : string
+sort : { field: "CreationTime", direction: "asc" | "desc" }
+limit: 既定 100
+```
+
+→ **LLM は「特定情報」（process_name / status / time_range）を出す。Code がそれを `filters[]` に変換**する（「LLM は条件、Code が OData 組み立て」の原則どおり）:
+
+| LLM の特定情報 | → Code が作る filters[] 要素 |
+|---|---|
+| `process_name = "InvoiceBot"` | `{field:"ReleaseName", operator:"eq", value:"InvoiceBot"}` |
+| `status = "Faulted"` | `{field:"State", operator:"eq", value:"Faulted"}` |
+| `time_range「今日」` | `{field:"CreationTime", operator:"ge", value:<開始>}` ＋ `{field:"CreationTime", operator:"le", value:<終了>}` |
+
+注意:
+- `ReleaseName` は **`eq`＝完全一致**。部分一致は不可 → 曖昧なプロセス名は候補提示 or 聞き返し
+- 時刻は **`CreationTime`**（`StartTime` ではない）、値は **ISO 8601**。JST↔UTC 変換は **Code が一元化**（下記 3.4「タイムゾーン」）
+
+### 2.3 job_log は search_jobs → search_logs(job_key)
+
+- **特定 = `search_jobs`**（filters で絞って JobKey 付き一覧）
+- **取得 = `search_logs(job_key)`**（その1ジョブのログ。`keyword` / `level` でジョブ内も絞れる、`log_limit=500` で件数上限）
+- **job_key は Code が解決**（`last_jobs` / 検索結果を照合。LLM には生成させない。4.5 参照）
+
+```mermaid
+flowchart TD
+  U["『このジョブのログがほしい』"] --> R{"対象ジョブは特定済み?（直前の一覧にある）"}
+  R -- "はい：参照を job_key へ解決" --> G["search_logs(job_key)"]
+  R -- "いいえ / 曖昧" --> S["search_jobs(filters)"]
+  S --> C{"候補の件数"}
+  C -- "1件" --> G
+  C -- "複数" --> ASK["候補を提示して聞き返し"]
+  ASK --> PICK["ユーザーが選ぶ → job_key 解決"]
+  PICK --> G
+  C -- "0件" --> Z["該当なし"]
+  G --> OUT["1ジョブのログを返す"]
+```
+
+- `search_logs` は **`keyword` を取れる** → 「**このジョブのログで timeout を探して**」のような**ジョブ内検索**も job_log で対応できる
+- job_key の解決は**会話に固有**なので**ホスト側（Code）**の仕事（`last_jobs` を使う）
+
+### 2.4 ログ量・横断の重さは「ツール側で既定ガード済み」
+
+実ツールには安全弁が入っている（9章 P1 ギャップの一部は**解決済み**）:
+
+- `search_logs.log_limit = 500` → 1ジョブのログは既定 500 件で頭打ち（**巨大化を自動抑制**）
+- `analyze_historical_logs`：`days=30`（既定窓）, `job_limit=20`, `log_limit=500`, 出力に `job_search_truncated` / `truncated_job_count`（**打ち切りを明示**）
+- `keyword` は **`analyze_historical_logs` では必須**（横断は必ず keyword で絞る）
+
+### 2.5 公開ツール仕様（実シグネチャ）
+
+```python
+# 1) ジョブ検索・特定
+search_jobs(
+    filters: list,            # 必須。各要素 {field, operator, value}
+                              #   field: State|CreationTime|ReleaseName / operator: eq|ge|le / value: str
+    limit: int = 100,
+    sort: dict = None,        # {field: "CreationTime", direction: "asc"|"desc"}
+) -> list[Job]                # Job: JobKey, State, CreationTime, ReleaseName(プロセス名) …
+
+# 2) 特定1ジョブのログ（＋ジョブ内キーワード検索）
+search_logs(
+    job_key: str,             # 必須。Code が解決して渡す（ユーザー/LLM は打たない）
+    keyword: str = None,      # ジョブ内の絞り込み（任意）
+    log_limit: int = 500,
+    level: str = None,        # 例: "Error" など（任意）
+) -> RobotLogs                # Message, RawMessage, Level, Timestamp …
+
+# 3) 過去ジョブの横断検索（重い）
+analyze_historical_logs(
+    process_name: str,        # 必須
+    keyword: str,             # 必須
+    days: int = 30,
+    job_limit: int = 20,
+    log_limit: int = 500,
+    level: str = None,
+) -> dict                     # 対象ジョブ件数 / 一致ログ件数 / RobotLogs /
+                              # job_search_truncated / truncated_job_count
+```
+
+> 補足: 入力パラメータ名は `job_key`（アンダースコア）、出力フィールドは `JobKey`。本書の本文では概念として「jobkey」と書く。
+
+### 2.6 jobkey（job_key）の扱い（まとめ）
+
+- **job_key は search_logs の主入力**。ただし **ユーザー/LLM の発話には出さない**。Code が解決して埋める
+- **解決元は `last_jobs`**（直前の search_jobs 結果のキャッシュ）。ユーザーの参照をそこに照合して job_key を得る
+  - 「そのジョブ」「さっきの」→ 直近の1件 / 文脈から
+  - 「2番目の」→ 一覧の位置
+  - 「失敗した InvoiceBot の」→ 条件で一覧を絞って一意なら確定
+- **一意に決まらなければ推測せず聞き返す**（候補を提示）
+- **一覧が無い状態でいきなり「○○のログ」** と言われたら → まず `search_jobs` を走らせて特定ステップに回す
+
+---
+
+## 3. Dify チャットフロー設計
+
+### 3.1 前提：turn = 1実行
+
+Dify チャットフローは **1ユーザー発言 = Start から下まで1回の実行**。フロー内でユーザーの返事を待つループは無い。「聞き返し」は **Answer でそのターンを終わらせる**こと（＝入力待ちに戻る）で実現する。
+
+### 3.2 全体フロー
+
+```mermaid
+flowchart TD
+  ST["Start（ユーザー発言）"] --> CL["分類LLM（構造化出力・memory ON）"]
+  CL --> CODE["Code: 正規化＆型組み立て（型の関所）＋ filters[] 変換"]
+  CODE --> IFC{"聞き返しが必要?"}
+  IFC -- "はい" --> ASK["Answer: 不足を聞き返す"] --> ENDT["ターン終了"]
+  IFC -- "いいえ" --> ROUTE{"intent で分岐"}
+  ROUTE -- "job_status" --> B1["search_jobs(filters)"]
+  ROUTE -- "job_log" --> B2["job_key 解決 → search_logs（下記 3.6）"]
+  ROUTE -- "history_search" --> B3["analyze_historical_logs"]
+  ROUTE -- "out_of_scope" --> B5["Answer: できること案内"]
+  B1 --> FMT["整形LLM（所感を一言添える）"]
+  B2 --> FMT
+  B3 --> FMT
+  FMT --> ANS["Answer"]
+```
+
+### 3.3 分類＋抽出ノード（1ノードで両方）
+
+質問分類・タスク分類・パラメータ抽出・制御フラグを **1つの構造化出力 LLM ノード**で出す（質問分類器＋パラメータ抽出器を畳んだ形）。
+
+- **memory（会話履歴）を ON**：指示語「それ」「さっきの」を履歴から解決させる
+- **出力はフラットな文字列のみ**（object / boolean を出させない → 3.4）
+
+### 3.4 型の扱い（Gemini 対策）— Code を型の関所に＋filters 変換
+
+**Dify の構造化出力は型を"強制"しない**（特に Gemini）。boolean 指定でも `"true"` と文字列で返る、object 指定でも崩れる。だから:
+
+| やりたいこと | 対策 |
+|---|---|
+| boolean がほしい | **使わない。文字列 enum（`"ask"/"execute"`）にする** |
+| object / 配列がほしい | **LLM はフラット文字列で出す → Code ノードで組み立てる** |
+| キーの存在を保証 | JSON Schema の `required`（キー存在は守られる） |
+| 値の選択肢を固定 | `enum`（一番強く効く） |
+| 値が非空（業務的な必須） | schema では無理 → **Code / IF で判定**（空文字 `""` = 未指定） |
+
+**Code の役割は2つ**: ①型の正規化・検証、②**特定情報 → `search_jobs.filters[]` への変換**（2.2 の対応表）。
+
+```python
+# Code ノード：寛容パース → 型確定 → filters[] 組み立て
+def to_bool(v): return str(v).strip().lower() in ("true", "1", "yes")
+
+def build_filters(process_name, status, time_from, time_to) -> list:
+    f = []
+    if process_name: f.append({"field":"ReleaseName","operator":"eq","value":process_name})
+    if status:       f.append({"field":"State","operator":"eq","value":status})
+    if time_from:    f.append({"field":"CreationTime","operator":"ge","value":time_from})
+    if time_to:      f.append({"field":"CreationTime","operator":"le","value":time_to})
+    return f
+
+def main(decision, process_name, status, time_from, time_to) -> dict:
+    return {
+        "need_clarify": (str(decision).strip().lower() == "ask"),
+        "filters": build_filters(process_name, status, time_from, time_to),
+    }
+```
+
+> UiPath の検索は `filters[]`（OData 風）。「LLM は条件を文字列で抜く → Code で filters 組み立て」は妥協ではなく正攻法。
+
+**タイムゾーン（決定: 案A = MCP は UTC を返すと確認済み。Code で JST↔UTC を一元変換。値は ISO 8601）**
+
+- 変換は **1 箇所（Code 関所）**。入力 JST→UTC、出力 UTC→JST
+- 入力: 「今日 / 先週」の境界は **まず JST で計算 → UTC へ −9h**（UTC で「今日」を計算しない）。JST は DST 無しなので ±9h 固定で安全
+- 出力: `CreationTime` / `Timestamp`（UTC, ISO 8601）は **Code が +9h して JST 表示**。**LLM に ±9h・日付計算をさせない**
+- `time_range` は LLM が**トークン**で出す（`today / yesterday / this_week / last_7_days / custom＋明示日付`）→ Code が具体 JST 範囲 → UTC に解決
+- ✅ **確認済み：MCP は UTC を返す** → Code が +9h で JST 表示（二重変換なし）。入力は Code が JST→UTC
+- ⚙ **filters[] は Code が作る**：LLM はフラットな意味フィールド（process_name / status / time_range）まで。ネストの `filters[]` 組み立てと JST→UTC は Code（LLM にネストを出させない）
+
+### 3.5 intent 分岐 / 整形と所感
+
+- `IF/ELSE` は Code が確定させた **文字列 / enum** で分岐（boolean に頼らない）
+- **v1 では構造的な集計を作らない**。整形 LLM が取得データに **「所感」を一言添える**だけ:
+  - **所感は定性的に**（パターン・気づき）。**正確な件数/率を断定しない**（大量データ・Gemini では数え間違える）。数字は**見えているデータから確実に言える範囲**だけ
+  - **データ本体が正、所感は補助**。一覧/ログはそのまま見せ、所感は上に一言
+  - 所感のガード：**「何が起きているか」の観察まで**。**原因推定・対応提案はしない**（それは B）
+- 正確な集計（失敗率・時間帯分布 等）が必要になったら将来対応（7章）
+- **コスト**：一覧/ログの表示は Code テンプレートにでき、所感の LLM は条件付き/オフにできる（→ 3.7）
+
+### 3.6 job_log ブランチ（job_key 解決 → search_logs）
+
+search_logs は job_key が要る。だから job_log ブランチは **「対象を特定してから取得」** の形にする。
+
+**絞り込みの3軸**：`process_name` / `status`（実行中=Running / エラー=Faulted / 成功=Successful）/ `time_range`（→ Code が `filters[]` に変換）
+- `time_range` は未指定なら **既定窓**（例: 今日）で件数を縛る
+- **3つ全部必須ではない**。候補が**一覧できる数に絞れれば十分**。足りなければ残りの軸で聞き返す
+- **実質の必須は「プロセス名」だけ**（status / 期間は任意の絞り込み）。プロセス名が無ければ「どのプロセス？」と聞く。ただし「さっき失敗したやつ」のように **status＋期間で絞れるならそれでも可**
+
+```mermaid
+flowchart TD
+  IN["job_log と分類"] --> Q{"last_jobs で一意に解決できる?"}
+  Q -- "はい" --> G["search_logs(job_key)"] --> FMT["整形 → Answer"]
+  Q -- "いいえ" --> E{"絞り込み軸がある?（process/status/期間）"}
+  E -- "なし" --> ASKP["聞き返し: どのプロセス / いつ頃?"]
+  E -- "あり" --> S["search_jobs(filters) ＋ 既定期間"]
+  S --> N{"候補の件数"}
+  N -- "0件" --> Z["該当なし（期間拡大を提案）"]
+  N -- "1件" --> G
+  N -- "数件" --> ASK["候補提示 → pick（pending）"]
+  N -- "多すぎ" --> NAR["残りの軸で絞る聞き返し"]
+```
+
+- 参照解決（「そのジョブ」「2番目」→ job_key）は **Code の仕事**（last_jobs や search_jobs 結果を照合）。**LLM に job_key を生成させない**（GUID のコピー事故を避ける）
+- **推測で latest を選ばない**。数件なら候補提示、多すぎなら絞る聞き返し
+- 出した候補は **last_jobs に保存** → 次ターンで pick を job_key に解決（pending で再開）
+- 「このジョブのログで○○を探して」は **search_logs(job_key, keyword=○○)** で対応
+
+**参照 → job_key の解決（Code）**
+
+LLM は「参照の種類」を `ref_type` で分類し、位置は `ref_position` で出す（**job_key＝GUID は作らない**）。Code が `last_jobs` / `ctx_current_job_key` から実 job_key を引く。
+
+| ref_type | 例 | Code の解決元 |
+|---|---|---|
+| `position` | 「2番目」「最初の」「最後の」 | `last_jobs[ref_position-1]` の JobKey |
+| `attribute` | 「失敗した InvoiceBot の」 | 候補プールを process/status/time で絞る |
+| `recent` | 「さっきの」「その」「続き」 | `ctx_current_job_key`（直近見たジョブ） |
+| `none` | 参照なし | 候補生成パス（search_jobs → 件数分岐） |
+
+```text
+解決アルゴリズム（Code・優先順）:
+1. recent かつ ctx_current_job_key あり → それ
+2. position かつ last_jobs あり        → last_jobs[pos-1].JobKey
+3. attribute / none:
+     pool = last_jobs（あれば）else search_jobs(filters)
+     pool を process/status/time で絞る
+       1件  → その JobKey
+       複数 → 候補提示して聞き返し（pending）
+       0件  → 期間拡大を提案 / 該当なし
+4. 解決できたら ctx_current_job_key に保存（次の「さっき」用）
+→ search_logs(job_key)
+```
+
+- **推測しない**：`none` で複数なら latest を勝手に選ばず聞き返す
+- **「さっき/その」は推測ではない**：直前に 1 件のログを見せた job_key を `ctx_current_job_key` に持っているだけ
+- JP 序数（「二番目 / 2つ目 / 最後」→ 数値）は **LLM が `ref_position` に正規化**（Code 側パースは最小限）
+
+### 3.7 コスト最適化（LLM 回数・トークン）
+
+> 1ターンに LLM は最大 **2回**：① 分類（ツール前）＋ ② 整形/所感（ツール後）。① はツールの前に必須なので残すが、**② と入力トークンは削れる**。
+
+**効く順**:
+
+1. **ログ（最大 500 行）を LLM に丸ごと渡さない** ← 最大のトークン源
+   - 表示は **Code テンプレート**。所感が要っても**件数・エラー行など減らした材料**だけ LLM に渡す
+2. **② 整形 LLM を条件付きに**
+   - 一覧/ログの**表示は Code テンプレート**（決定的）。LLM は**所感が要るときだけ**、または**所感オフ** → 多くのターンで **1 LLM** に
+3. **スキーマ・履歴・last_jobs をスリムに**
+   - スキーマは**キャッシュ**（毎ターン HTTP 取得＆全文注入しない）
+   - 会話履歴は**直近 N ターン**に制限
+   - last_jobs は**必要フィールドだけ**（index / process / status / time / job_key）＋件数上限
+4. **モデルは Gemini Flash**（分類も整形も軽いタスク）
+5. **LLM ゼロで返せる場面**：out_of_scope（定型文）、単純なデータ列挙（Code テンプレ）
+
+> ① 分類だけは残す（routing の要）。それ以外は「**Code でできることは Code、LLM は判断・言語化の最小限**」でトークンを圧縮。これまでの原則（選択は Code・判断はサーバ）と一致。
+
+---
+
+## 4. 分類器（intent）設計
+
+### 4.1 intent 一覧とツール対応
+
+| intent | 実ツール | 単一/複数 |
+|---|---|---|
+| `job_status` | search_jobs | 一覧 |
+| `job_log` | **search_logs**（job_key 解決を伴う） | 単一ジョブ |
+| `history_search` | analyze_historical_logs | 複数ジョブ |
+| `out_of_scope` | なし（できること案内） | — |
+
+> **集計（失敗率・時間帯分布など）は v1 では作り込まない**。整形 LLM が取得データに**所感を一言添える**だけに留める（定性的・数値は断定しない）。正確な集計は将来（7章）。
+
+### 4.2 見分けシグナル
+
+| シグナル | → intent / ツール |
+|---|---|
+| ジョブ自体を並べたい（「今日の」「失敗した一覧」「実行中」） | `job_status` / search_jobs |
+| **特定の1ジョブ**のログ（「この」「さっきの」「2番目の」「この時間の」） | `job_log` / search_logs |
+| **キーワードで探す・過去横断**（「〇〇エラーが出た過去」「いつも」「履歴から」） | `history_search` / analyze_historical_logs |
+| 傾向・割合・件数（「エラー傾向」「失敗率」「多い時間帯」） | v1 は非対応。`job_status` の結果に**所感**で軽く触れる／明確な集計要求は out_of_scope 案内 |
+| 原因・対応（「なぜ」「どう直す」） | → **B の領域**。今は out_of_scope で案内 |
+
+**最強の判別**: *keyword で過去を横断* なら `history_search`、*一覧の中の特定1件* なら `job_log`。
+（「特定1件のログの中を keyword で探す」は job_log＝search_logs の keyword。「過去の複数ジョブを keyword で横断」は history_search。）
+
+### 4.3 構造化出力スキーマ（LLM が出す「特定情報」）
+
+```jsonc
+{
+  "type": "object",
+  "properties": {
+    "intent":       { "type": "string",
+                      "enum": ["job_status","job_log","history_search","out_of_scope"] },
+    "decision":     { "type": "string", "enum": ["ask","execute"] },  // boolean を使わない
+    "process_name": { "type": "string" },   // 未指定は空文字 ""（Code が ReleaseName eq に変換）
+    "status":       { "type": "string", "enum": ["Faulted","Running","Successful","Stopped",""] }, // Code が State eq に
+    "time_range":   { "type": "string" },   // Code が CreationTime ge/le に変換
+    "keyword":      { "type": "string" },   // search_logs のジョブ内検索 / analyze_historical_logs（必須）
+    "level":        { "type": "string" },   // 例 "Error"（任意）
+    "ref_type":     { "type": "string", "enum": ["position","attribute","recent","none"] }, // 参照の種類（job_log）
+    "ref_position": { "type": "string" }    // position のとき番号（"2" 等）→ Code が last_jobs の index に
+  },
+  "required": ["intent","decision","process_name","status","time_range","keyword","level","ref_type","ref_position"]
+}
+```
+
+- 全フィールド `required`（キーは必ず出る → Code が楽）。値は空文字許可（`""` = 未指定）
+- 分類系は `enum`（Gemini でも守りやすい）。ネスト無し・boolean 無し
+- **これは LLM が出す「条件/特定情報」**。実ツールの引数（`filters[]` / `job_key` 等）へは **Code が変換**する
+- `ref_type` / `ref_position` が「どの行を指すか」。**Code が** `last_jobs` / `ctx_current_job_key` に照合して job_key に解決（**LLM は job_key を作らない**。アルゴリズムは 3.6）
+
+> **強制スキーマの置き方は2案**（4.5 参照）：**(X) このフラット項目（enum 付き）をそのまま構造化出力の強制スキーマにする**（静的・Gemini で安定／推奨）／ **(Y) 固定の箱 `{intent, params}` にして、取得スキーマをプロンプト注入で params を動的に埋める**（動的・DRY だが params がゆるい）。どちらでも **Code 検証は必須**。
+
+### 4.4 follow-up の考え方
+
+- follow-up は **intent 遷移（A→A / A→B）では決まらない**
+- 判定軸は **「この発言、単体で完結してる？ それとも前の文脈に寄りかかってる？」**
+  - 寄りかかりシグナル: 指示語「それ/その/さっき」・対象の省略・絞り込み「〜だけ」・追加「他には」
+- **実行可否の判断には使わない**。実行を決めるのは「必要な情報（job_key など）が揃ったか」
+- is_followup フラグは **あっても UX / ログ用**。分岐の主軸にしない
+
+### 4.5 動的スキーマ展開と「特定（identify）情報」
+
+**狙い**：ツールの引数スキーマを Dify に二重定義せず、**MCP から取得して LLM に渡す**（Single Source of Truth）。引数が変わっても Dify を直さなくていい。
+
+**用語「特定（identify）情報」**：「どのジョブか」を突き止めるための手がかり ＝ `process_name / status / time_range / ref_type / ref_position`（「2番目」等の参照）。**job_key そのものではなく、job_key を探すための入力**。
+
+**決定**：**job_key は Code が解決する**（LLM には GUID を生成・コピーさせない）。LLM は「特定情報」までを出す。
+
+**流れ**：
+
+```mermaid
+flowchart TD
+  H["HTTP: MCP からツールのスキーマ取得"] --> CL["分類LLM：固定の箱 { intent, params } ＋ 取得スキーマ"]
+  CL --> P["LLM が intent を判定し params を展開（特定情報まで）"]
+  P --> CODE["Code: 検証・正規化、filters[] 変換、job_key 解決"]
+  CODE --> EX{"intent で実行"}
+  EX -- "job_status" --> T1["search_jobs(filters)"]
+  EX -- "history_search" --> T3["analyze_historical_logs(process_name, keyword, …)"]
+  EX -- "job_log" --> J["search_jobs → (Code が)job_key 解決 → search_logs(job_key)"]
+```
+
+**固定の箱（案Y の場合の Dify 構造化出力）**：箱は固定、中身 `params` は動的。
+
+```jsonc
+{
+  "intent": "job_status | job_log | history_search | out_of_scope",
+  "params": { /* 中身は選ばれた intent のスキーマで形が変わる（固定でない） */ }
+}
+```
+
+**取得スキーマの"反映先"はプロンプト（＝強制スキーマではない）**
+
+- Dify の構造化出力の**強制スキーマはノード設定＝静的**。リクエストごとに差し替えるのは難しい
+- なので **MCP から取得したスキーマは「プロンプトに注入」**して「params をこう埋めよ」と**ガイド**する。構造化出力の**強制**には載らない
+- 結果、案Y の `params` は**ゆるい箱**。中身は厳密強制されない → **Code の関所で検証・正規化が必須**
+
+> **推奨（案X / Gemini 安定重視）**：強制スキーマを **4.3 のフラット項目（enum 付き）**にする。intent / status / ref_type 等が**強制**されて型崩れが激減。取得スキーマは「LLM が意味を理解するためのプロンプト参照」に留める。動的さ（新パラメータで Dify を触らない）より**信頼性**を取る選択。
+
+**核心：LLM が展開するスキーマ ＝ 最終的に呼ぶ MCP ツール、とは限らない**
+
+| intent | LLM が params に展開するスキーマ | 実行で呼ぶ MCP |
+|---|---|---|
+| `job_status` | 特定情報 `{process?, status?, time?}` | search_jobs（Code が filters[] 変換） |
+| `history_search` | `{process_name(必須), keyword(必須), days?, level?}` | analyze_historical_logs（ほぼ 1:1） |
+| **`job_log`** | **特定情報** `{process?, status?, time?, ref_type?, ref_position?, keyword?, level?}` | search_jobs →(Code 解決)→ **search_logs(job_key)** |
+
+- `history_search` は実ツール引数とほぼ 1:1（keyword 必須に注意）
+- **`job_log` だけ別**：search_logs の主入力は `job_key` だが、**job_key は LLM に作らせない**。LLM は **特定情報**までを出し、**Code が job_key を解決**して search_logs を呼ぶ（keyword/level は LLM の値をそのまま渡せる）
+- → **スキーマレジストリに「生の job_key を要求する形」は載せない**。job_log 用に「特定情報」スキーマを載せる
+
+**具体例（job_log）**：
+
+```text
+ユーザー:「InvoiceBot の失敗ジョブの、2番目のログ」
+
+LLM 出力（固定の箱）= 特定情報まで:
+  intent = "job_log"
+  params = { "process_name":"InvoiceBot", "status":"Faulted", "time_range":"",
+             "ref_type":"position", "ref_position":"2", "keyword":"", "level":"" }  ← job_key は出さない
+
+Code の処理:
+  filters = [{ReleaseName eq InvoiceBot},{State eq Faulted}]
+  last_jobs で「2番目」が引ける → その job_key
+  無ければ search_jobs(filters) → 候補（1件→それ / 複数→聞き返し）
+  → search_logs(job_key)
+```
+
+**ガード（Gemini 対策・再掲）**：
+
+- 取得スキーマは **フラット＆文字列中心**（深いネストを渡さない）
+- `params` は自由度が高い分、**Code の関所で検証・正規化＋filters 変換＋job_key 解決**
+- **「必須＝プロセス名」もこの Code 検証で効かせる**（Dify に埋め込まない）
+- **job_key は LLM に生成させない**（GUID はコピー事故の元 → Code で確定）
+
+---
+
+## 5. 会話状態と多ターン
+
+### 5.1 聞き返し（ターンまたぎ）
+
+```mermaid
+sequenceDiagram
+  actor U as ユーザー
+  participant D as Dify フロー
+  participant V as 会話変数
+  U->>D: 「今日の失敗ジョブ」
+  D->>D: search_jobs(filters: State=Faulted, CreationTime=today)
+  D->>V: last_jobs に一覧を保存
+  D-->>U: 一覧を表示（3件）
+  U->>D: 「2番目のログ」
+  D->>V: last_jobs を読む → 2件目の job_key に解決
+  D->>D: search_logs(job_key)
+  D-->>U: ログを表示
+```
+
+複数ヒットで一意に決められない時は、`pending` を使って「どれ？」と聞き返す（下記）。
+
+### 5.2 pending 状態のライフサイクル
+
+**何を入れるか**: 分類 LLM の出力の一部（`intent` と途中まで集まった情報・候補）をそのまま保存。新しい情報は作らない。
+
+**型**: 配列ではない（同時に1件だけ）。
+- `pending_intent` : String（分岐しやすさのため。空 `""` = 保留なし）
+- `pending_params` : Object（集めかけの情報。job_log なら候補 job_key 群など）
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty
+  Empty --> Pending: 不足/曖昧 → 聞き返し（保存）
+  Pending --> Empty: 揃って実行（クリア）
+  Pending --> Empty: 話題変更で破棄
+  Empty --> Empty: 最初から完結 → 実行
+```
+
+- 「聞き返したら書く／揃ったら消す」。毎ターン “書く or 消す” のどちらかを通る
+
+### 5.3 会話変数一覧（最小構成で開始）
+
+| 変数 | 型 | 役割 | いつ |
+|---|---|---|---|
+| `last_jobs` | Array | 直近 search_jobs 結果（JobKey 付き） | **必須級**（「そのジョブ」を job_key へ解決する基盤） |
+| `pending_intent` | String | 聞き返しの再開（分岐用） | 必須（最初から） |
+| `pending_params` | Object | 集めかけの情報・候補 | 必須（最初から） |
+| `ctx_current_job_key` | String | 「さっき/その」のジョブ（直近 search_logs した job_key） | job_log の follow-up（recent 参照）用 |
+| `ctx_process` 等 | String | 引き継ぎ（「そのプロセス」補完） | **後付け**。まずは会話メモリで代替 |
+
+> **最小構成 = `last_jobs` ＋ `pending_intent` ＋ 会話メモリ**。
+> `last_jobs` は identify→fetch の土台なので最初から要る。プロセス名などの引き継ぎはまずメモリで試し、取りこぼしたら `ctx_*` を足す。
+
+### 5.4 キャッシュ方針
+
+- **`last_jobs` は照会アシスタントの基盤**。search_jobs を実行したら**必ず更新**する
+- search_logs は job_key で取るので、「そのジョブ」の job_key はこのキャッシュから解決する
+- キャッシュが古くて不安な場合（長時間経過・状態が変わった可能性）だけ、search_jobs を一度引き直してから解決すればよい
+
+---
+
+## 6. 実装の進め方（順番）
+
+1. **分類スキーマ確定**（4.3 をツールに合わせて詰める。`ref_type` / `ref_position` / `keyword` / `level` を忘れず）
+2. **search_jobs 疎通 ＋ last_jobs 保存**（Code の filters[] 変換込み。一覧を出して覚える）
+3. **job_log ブランチ**（last_jobs から job_key 解決 → search_logs。曖昧なら聞き返し）
+4. **analyze_historical_logs**（過去ログ横断。keyword 必須）＋ **整形で所感を添える**仕上げ
+5. **聞き返し ＋ pending の仕上げ**（5章）
+6. （将来）**B：障害調査**
+
+> まず 1→2→3 で「一覧を出す → そのジョブのログを出す」の主線を通すのが最優先。これが A の背骨。
+
+---
+
+## 7. 未決事項 / TODO
+
+- [x] `analyze_historical_logs` の `keyword` は **必須**（実ツールで確定）。「keyword 無しの横断」は非対応 → その場合は job_status で一覧 → 個別 job_log
+- [x] 横断の**重さ対策** → 実ツールに `days=30` / `job_limit=20` / `log_limit=500` / `truncated` 系が内蔵（確定）
+- [x] 実際の OC フィールド名 → **JobKey / State / CreationTime / ReleaseName**、ログは **Message / RawMessage / Level / Timestamp**（確定）
+- [ ] **time_range の解釈＋タイムゾーン**：「今日/先週」→ `CreationTime` の from/to 文字列へ。UTC/JST とフォーマット（9章 P0）
+- [x] **job_key 参照解決**：`ref_type`（position/attribute/recent/none）で LLM が分類 → Code が `last_jobs` / `ctx_current_job_key` で解決（3.6）。残は実装（JP 序数正規化・edge）
+- [ ] `last_jobs` に**何を保持するか**（JobKey / ReleaseName / State / CreationTime / 表示順）。鮮度切れの判定基準
+- [ ] **候補提示のしきい値**（何件までリスト／何件から「絞って」）と `time_range` 既定窓の長さ
+  - ※ **必須は「プロセス名」に決定**（status・期間は任意）
+- [ ] **プロセス名は `ReleaseName eq`＝完全一致**。ユーザーの曖昧/部分名をどう扱うか（候補提示 / 別途一覧から選ばせる）
+- [ ] **フォルダ / Organization Unit**：実ツールの引数に無い → MCP が内部でスコープ？要確認（9章 P0）
+- [ ] **集計（将来）**：v1 は「所感」のみ。正確な集計が要るなら B 方式を後付け
+
+---
+
+## 8. 付録：B（将来）への布石
+
+- B は会社都合で後回し。ただし本書の設計は B を見据えている。
+- **`analyze_historical_logs` は「過去に同じことが起きたか」を構造的（キーワード）に答えるツール** = B（障害調査）の一次調査部品にそのまま再利用できる。
+  - `analyze_historical_logs`（キーワード・構造的・今ある） ↔ 将来の RAG（意味・セマンティック・B）
+- B を作るときの芯:
+  - **Runbook 化**（状態確認 → ログ → エラー分類 → 既知パターン照合 → 対応提案）で LLM 判断を最小化
+  - RAG は**素朴なベクトル検索でなく「エラーシグネチャ → 根本原因 → 対応」の構造化辞書**＋フォールバック
+  - **ジョブ失敗イベントをトリガーに自動調査**（リアクティブ → プロアクティブ）
+  - 判断系は tool-use の強いモデル（Claude 等）、量が出る整形は Gemini、と使い分けも検討
+
+---
+
+## 9. 実装レディネス（ギャップ分析）
+
+> 設計の骨子（方針・役割分担・フロー）は固まり、**実ツール仕様も判明**した。残る未定義を優先度順に。**P0 が埋まれば MVP 着手可能**。
+
+### 9.1 P0：これが無いと作れない
+
+| ギャップ | 状態 | 何が未定義 | 関連 |
+|---|---|---|---|
+| **ツール I/O 契約** | ✅ 解決 | 実フィールド判明（JobKey/State/CreationTime/ReleaseName、Message/RawMessage/Level/Timestamp）。時刻は ISO 8601 | 2章 |
+| **OC 認証・接続** | ✅ 解決 | **テスト確認済み**（MCP クライアントに tenant / folder / user / password 設定） | 2章 |
+| **フォルダ / Organization Unit** | ✅ 解決 | **単一「default」フォルダ固定**（MCP 設定）。フロー側はフォルダ非意識。複数フォルダは将来 | 2章 |
+| **time_range の解釈** | 🔶 設計確定 | 形式 ISO 8601・案A 確定（**MCP=UTC 確認済み** / Code で JST↔UTC）。残：実装（境界 JST→UTC、出力 +9h） | 2.2, 3.4 |
+| **job_key 参照解決ロジック** | 🔶 設計確定 | ref_type（position/attribute/recent/none）＋ Code アルゴリズム（3.6）。残：実装・JP 序数正規化・edge ケース | 2.6, 3.6, 4.5 |
+
+### 9.2 P1：動くが穴（早期に必要）
+
+| ギャップ | 状態 | 内容 | 関連 |
+|---|---|---|---|
+| **ログ巨大化対応** | ✅ 一部解決 | `log_limit=500` で頭打ち済み。残はエラー行抽出/要約の方針 | 2.4 |
+| **横断検索の仕様確定** | ✅ 解決 | analyze_historical_logs：keyword 必須・days/job_limit/log_limit・truncated（実ツール確定） | 2.4, 2.5 |
+| **エラーハンドリング** | ⬜ 未 | ツール失敗（ダウン/タイムアウト/認証/404）、空結果、**スキーマ取得(HTTP)失敗** | 全般, 4.5 |
+| **pending の具体形** | ⬜ 未 | `pending_params` の中身＋次ターンの**再開判定プロンプト** | 5.2 |
+| **しきい値・既定窓** | ⬜ 未 | 「数件/多すぎ」の数、`time_range` 既定窓の長さ | 3.6 |
+| **分類 LLM の実プロンプト** | ⬜ 未 | 各 intent の説明＋例、last_jobs/pending/スキーマの使い方 | 3.3, 4章 |
+| **status 語彙マップ** | ⬜ 未 | JP→OC 全 State（Pending/Stopped/Stopping/Suspended/Resumed/Terminating …） | 4.3 |
+| **整形(所感) プロンプト** | ⬜ 未 | 一覧/ログの整形フォーマット＋所感のガード | 3.5 |
+| **プロセス名の完全一致問題** | ⬜ 未 | `ReleaseName eq` なので部分/曖昧名が引けない。候補提示などで吸収 | 2.2 |
+
+### 9.3 P2：後回し / 磨き込み
+
+- 複合リクエスト（1 発話に複数 intent。v1 は非対応と割り切る想定）
+- out_of_scope の具体文言
+- 会話変数の TTL / サイズ上限（last_jobs 保持件数）
+- **eval セット**（質問 → 期待 intent / 出力を 20〜30 件。回帰検知）
+- 非機能／**コスト**：LLM は 1ターン最大2回（分類＋整形）。表示 Code 化・所感条件付き・スキーマ/履歴/last_jobs スリム化・Flash 採用で削減（→ **3.7**）。スキーマ取得キャッシュ、OC レート制限、レイテンシ
+- 権限 / 監査（誰が使えるか、操作ログ）
+
+### 9.4 MVP に最低限必要なもの
+
+主線「**一覧を出す → そのジョブのログを出す**」を動かすには:
+
+> **P0 は設計完了**（job_key 解決も確定）。**残るは実装**（time_range/filters/job_key の Code、分類・整形プロンプト）／ 残 P1：エラー処理・pending 具体形・しきい値
+
+ツール I/O・OC 接続/認証・フォルダ・横断の重さ・ログ量・TZ・**job_key 解決**まで**設計確定**。あとは実装（Code ＋ プロンプト）に入れる段階。
+
+---
+
+*この文書はチャットでの設計相談を構造化したもの。実装時は 9 章のギャップ（特に P0）を先に埋めるとスムーズ。*

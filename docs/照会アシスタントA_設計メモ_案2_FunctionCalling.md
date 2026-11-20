@@ -1,0 +1,395 @@
+# UiPath OC 照会アシスタント A — 設計メモ【案2: Function Calling（Agent ノード）】
+
+> これは **案2（別案）**。**案1（構造化出力＋決定的フロー）は別ファイル `照会アシスタントA_設計メモ.md` に保持**。
+> 本書は「MCP のスキーマ駆動（function calling）を主役にする」別設計。
+> 作成日: 2026-11-20 / モデル前提: Gemini（セルフホスト Dify）
+
+---
+
+## 目次
+
+- [0. 案1 との違い（要約）](#0-案1-との違い要約)
+- [1. 設計の背骨（案1と共通）](#1-設計の背骨案1と共通)
+- [2. ツール（案1と共通の実ツール）](#2-ツール案1と共通の実ツール)
+- [3. アーキテクチャ（案2の核）](#3-アーキテクチャ案2の核)
+- [4. routing（唯一ケアが要る所）](#4-routing唯一ケアが要る所)
+- [5. job_log（Agent 連鎖・Code はフェイルセーフ/位置参照）](#5-job_log)
+- [6. 残る Code / 消える Code](#6-残る-code--消える-code)
+- [7. コスト](#7-コスト)
+- [8. 会話状態・多ターン（案1と共通）](#8-会話状態多ターン案1と共通)
+- [9. 案1 vs 案2 比較](#9-案1-vs-案2-比較)
+- [10. 案2 固有の未解決 / 確認](#10-案2-固有の未解決--確認)
+- [11. データ取扱い方針（マスキング）](#11-データ取扱い方針マスキング)
+- [12. Agent プレイブック（プロンプト / description / 文脈）](#12-agent-プレイブックプロンプト--description--文脈)
+- [13. 会話状態のライフサイクル（保存/更新/破棄/注入）](#13-会話状態のライフサイクル)
+
+---
+
+## 0. 案1 との違い（要約）
+
+| | 案1（構造化出力・決定的フロー） | **案2（Function Calling・本書）** |
+|---|---|---|
+| arg 生成 | 分類LLM が特定情報 → **Code が filters[] 等を組み立て** | **Agent が MCP スキーマから直接生成**（filters[] も Agent） |
+| MCP スキーマ | 活きない（Code が再実装 or プロンプト参照） | **活きる**（schema 駆動で生成） |
+| routing | 分類器（構造化出力）で確実 | **description（＋必要なら軽いルーター）** |
+| Code 量 | 多い（filters・型変換） | **少ない**（job_key / TZ / 状態 / 整形のみ） |
+| 実績 | — | **Gemini でも arg 生成は動作確認済み**（例「最近のジョブを新しい順で3件」） |
+
+> **動機**：案1 は信頼性重視だが「せっかくの MCP スキーマが活きない」。実測で *arg 生成は Gemini でも OK・弱いのは routing だけ* と分かったので、**function calling を主役にし routing だけ補強**する。
+
+---
+
+## 1. 設計の背骨（案1と共通）
+
+- **A/B 分離**（A=照会・本書 / B=障害調査・将来 Teams 等）、**境界**（データで閉じる＝A / 知識・因果＝B）、**5W1H のリトマス**は案1と同じ。ここは共通資産
+- **原則の要点（案2版）**：
+  1. **arg 生成・ツール連鎖は function calling に任せる**（MCP スキーマ駆動。search_jobs→search_logs の GUID 連鎖も実測 OK）
+  2. LLM の弱点は **routing と 位置参照（「2番目」等）だけ** → **そこだけ守る**
+  3. **job_key は Agent がツール結果からコピー**（創作はさせない）。**Code は位置参照の解決とフェイルセーフのみ**
+  4. **日付・TZ は LLM にやらせない**（Code / ツール相対パラメータ）
+  5. 会話状態・聞き返し・整形はホスト（Dify）
+
+---
+
+## 2. ツール（案1と共通の実ツール）
+
+| ツール | 役割 | 出力 |
+|---|---|---|
+| `search_jobs(filters[], limit, sort)` | ジョブ検索・特定 | JobKey / State / CreationTime / ReleaseName |
+| `search_logs(job_key, keyword?, log_limit=500, level?)` | 特定1ジョブのログ（＋ジョブ内検索） | Message / RawMessage / Level / Timestamp |
+| `analyze_historical_logs(process_name, keyword, days=30, job_limit=20, log_limit=500, level?)` | 過去ジョブ横断（重い。keyword 必須） | 対象/一致件数, RobotLogs, truncated 系 |
+
+- **違いは arg の作り方だけ**：案2では **Agent が filters[] / 引数を schema から生成**（Code で組まない）
+- フォルダ＝単一 `default` 固定、時刻＝ISO 8601 / UTC、接続・認証はテスト済み（案1と共通）
+
+---
+
+## 3. アーキテクチャ（案2の核）
+
+```mermaid
+flowchart TD
+  ST["Start（ユーザー発言）"] --> RT{"routing（description で判定 / 必要なら前段ルーター）"}
+  RT -- "job_status" --> AG1["Agent(function calling): search_jobs"]
+  RT -- "history_search" --> AG3["Agent(function calling): analyze_historical_logs"]
+  RT -- "job_log" --> JL["Agent: search_jobs → search_logs を連鎖（位置参照のみ Code+last_jobs）"]
+  AG1 --> FMT["整形（所感 / Code テンプレ）"]
+  AG3 --> FMT
+  JL --> FMT
+  FMT --> ANS["Answer"]
+```
+
+- **Agent ノード（function calling）が主役**：MCP スキーマから arg を生成して直接呼ぶ
+- **routing は description で**（曖昧なら前段に軽い分類ルーター）
+- **job_log は基本 Agent が search_jobs→search_logs を連鎖**（GUID 連鎖は実測 OK）。Code は**フェイルセーフ**（空/エラーで偽成功にしない）と**位置参照の解決**のみ
+- 整形・所感・会話状態はホスト側（案1と共通）
+
+> 最初に避けた「1つの Agent に全部丸投げ」とは**違う**。routing を外に出し、**Agent には得意な arg 生成＋ツール連鎖**をさせ、**位置参照とフェイルセーフだけ Code**で守る。
+
+---
+
+## 4. routing（唯一ケアが要る所）
+
+実測で分かった弱点は **ツール選択（routing）だけ**。特にログ系（search_logs と analyze_historical_logs の混同）。対策は安い順に:
+
+1. **ツール `description` を「いつ使うか」で磨く**（MCP ネイティブ・最優先）
+   - `search_jobs`：ジョブ**一覧**がほしいとき（状態/期間/プロセスで絞る）
+   - `search_logs`：**特定の1ジョブ**のログ。ジョブ内を keyword で絞ることも
+   - `analyze_historical_logs`：**過去の複数ジョブ**を keyword で**横断**（keyword 必須・重い）
+2. まず **1 Agent ＋ 3ツール＋良い description** でテスト
+3. それでも曖昧なら **前段に軽い intent ルーター**（分類だけ）を足し、ブランチごとに狭いツールを渡す
+
+---
+
+## 5. job_log（基本は Agent 連鎖・Code はフェイルセーフ/位置参照のみ）
+
+**実測で Agent が search_jobs → search_logs を GUID 込みで連鎖できた（3回連続 OK）**。なので **基本は Agent に任せ**、「失敗する前提」で薄い安全網を置く:
+
+```mermaid
+flowchart TD
+  IN["job_log"] --> R{"位置参照?（2番目/さっきの一覧の…）"}
+  R -- "いいえ（通常）" --> AG["Agent: search_jobs → search_logs を連鎖（直近/最古/失敗/日付は sort・filter で自力）"]
+  R -- "はい" --> CODE["Code: last_jobs から job_key 解決 → search_logs"]
+  AG --> FS{"空 / エラー / 不正 job_key?"}
+  CODE --> FS
+  FS -- "いいえ" --> FMT["整形 → Answer"]
+  FS -- "はい" --> ASK["偽成功にしない → 再検索 or 聞き返し"]
+```
+
+- **基本**：Agent が search_jobs→search_logs を連鎖。「直近 / 最も古い / 失敗した / 日付」は search_jobs の sort・filter で自力解決し、得た job_key で search_logs を呼ぶ。job_key は**創作せずツール結果からコピー**
+- **フェイルセーフ（GUID 失敗前提）**：search_logs が **空 / エラー / 不正 job_key** を返したら **偽の成功にしない**（「取れませんでした → 再検索 or 聞き返し」）。search_logs 側も明確なエラー/空を返す設計に
+- **位置参照だけ Code**：「2番目 / さっき見た一覧の」は Agent（memory OFF）に見えない → **last_jobs ＋ Code で解決**。この参照を使わない運用なら **last_jobs/Code は不要**（必要になったら足す）
+- 複数ヒット → 候補提示 → pending で聞き返し（必要になったら）
+
+---
+
+## 6. 残る Code / 消える Code
+
+**消える・減る Code（案1比）**:
+- `filters[]` の組み立て（Agent が schema から生成）
+- 特定情報 → ツール契約への変換（案1の肝）
+- 型の寛容パース（function calling は型拘束で軽量）
+- → **search_jobs / analyze_historical_logs はほぼ Code レス**
+
+**残る Code（これは消せない）**:
+- **job_key 解決は位置参照時のみ**（通常は Agent 連鎖。「2番目」等で last_jobs から解決）
+- **TZ / time_range**（「今日」→ UTC。Agent に日付計算させない → Code で範囲算出 or ツール相対パラメータ）
+- **会話状態**（last_jobs / pending / ctx_current_job_key）
+- **整形 / 所感**（コスト対策で Code テンプレ化する場合）
+
+> 要点：**「引数を作る Code」は激減、「状態・TZ・フェイルセーフ・位置参照の Code」は残る。**
+
+---
+
+## 7. コスト
+
+- **1 Agent ＋ 良い description** = routing + args で **1 LLM**（＋整形）→ **案1と同程度**
+- **前段ルーターを足すと +1 LLM**（description で routing が足りなければ）
+- ログ丸渡し回避・所感条件付き・**Gemini Flash** 採用は案1と共通（別紙 3.7 の方針）
+- 注意：Agent 連鎖では **search_logs の結果が Agent に戻る**（ループ）。ログ量は **`log_limit`（控えめ）＋ level/keyword 絞り込み＝ツール引数**で制御（Code 制御ではない）。**巨大化が問題になった時だけ** search_logs 後を **Code 整形**に寄せる（＝その時だけ Code が介入）
+
+---
+
+## 8. 会話状態・多ターン（案1と共通）
+
+- `last_jobs`（直近 search_jobs 結果・JobKey 付き）＝ **位置参照**の job_key 解決の基盤
+- `pending_intent` / `pending_params` ＝ 聞き返しの再開
+- `ctx_current_job_key` ＝「さっき/その」のジョブ
+- `ctx_process` ＝「このプロセス/その」の対象プロセス（ユーザーが名指し or 一覧提示時に Code が set）
+- turn = 1実行、聞き返し = Answer でターン終了、次発言で再開（案1と同じ）
+- **Agent の会話メモリは OFF**（多ターンでツールを呼ばない不具合を回避＝10章）。**多ターン状態は上記の会話変数で明示的に持つ**（LLM メモリに依存しない）
+- **指示語対策（必須）**：memory OFF だと「このプロセス / さっき」が解けない → 毎ターン **「現在の文脈」ブロック（`ctx_process` / `ctx_current_job_key` / 直近一覧の要約）を Agent プロンプトに小さく注入**する（全履歴は不要・安い）。例: `現在の文脈: プロセス=InvoiceBot / 直近ジョブ=xxx / 保留=なし`
+
+---
+
+## 9. 案1 vs 案2 比較
+
+| 観点 | 案1（構造化出力・決定的） | 案2（Function Calling） |
+|---|---|---|
+| MCP スキーマ活用 | ✕（Code 再実装 / プロンプト参照） | ◎（schema 駆動で生成） |
+| Code 量 | 多い | **少ない**（job_key/TZ/状態のみ） |
+| routing 信頼性 | ◎（分類器） | ○（description、弱ければ+ルーター） |
+| arg 信頼性 | ○（Code が整形） | ◎（schema 拘束生成。実測 OK） |
+| コスト | 2 LLM | 2 LLM（ルーター追加で 3） |
+| 動的追従（ツール変更） | 手で追記 | **自動追従しやすい**（素通し引数） |
+| 制御・再現性 | ◎ | ○（Agent のループに注意） |
+| 他ホスト再利用 | △（ロジックが Dify 固有） | ○（MCP ネイティブ寄り） |
+
+**ざっくり**：案2 は **MCP の良さ（schema 駆動）が活き、Code が減る**。弱点は **routing と Agent ループの制御**。案1 は **routing・再現性が堅い**が **Code が多く schema が活きない**。
+
+---
+
+## 10. 案2 固有の未解決 / 確認
+
+- [x] ✅ **解決済み（memory OFF）**：Agent に job_key を渡すと「1回目成功・2回目以降 search_logs を呼ばず失敗（リセット＋F5 で回復）」する事象は、**Agent の会話メモリを OFF にすると解消**（＝過去の function call/result が履歴に残り「もう答えた」と短絡していた、が確定）。
+  - **代償と対策**：memory OFF で LLM は履歴を見ないが、**本設計は多ターン状態を会話変数（last_jobs / pending / ctx_current_job_key）で持ち、Code が解決する**ので影響は小さい。LLM は現発話の分類（intent / ref_type / 抽出）だけで足りる。曖昧な指示語用に **pending / ctx を小さくプロンプト注入**すれば十分（全履歴は不要・トークンも減る）。
+  - ※ 案1（決定的フロー）は元々この事象が起きない。**両案とも「状態は LLM メモリでなく会話変数で持つ」のが堅い**（共通原則）。
+- [x] ✅ **検証（チェーンは動く / 指示語は要 ctx 注入）**：
+  - 「直近のジョブのログ」→ **成功**（search_jobs → search_logs が連鎖＝function calling でチェーン可）
+  - 「**このプロセス**でもっとも古いジョブのログ」→ **失敗**（memory OFF で「このプロセス」の指す対象が不明）。「もっとも古い」自体は sort で可、問題は**プロセスの指示語**
+  - → 対策：**`ctx_process` を会話変数で保持し、毎ターン「現在の文脈」ブロックを注入**（8章）。文脈が本当に無ければ「どのプロセス？」と**端的に聞き返す**のが正
+  - ※ 案1 は memory ON で指示語を解けるため ctx は任意。**案2 は memory OFF ゆえ ctx 注入が必須**（案1/案2 の違い）
+- [ ] **routing が description だけで足りるか**（要テスト。特に job_log / history の混同）
+- [ ] **TZ の扱い**：Agent に日付計算させない前提で、Code で範囲算出 or **ツール側に相対パラメータ**（例 `days` / `range`）を持たせるか
+- [x] ✅ **job_log は Agent 連鎖を既定に**（GUID 連鎖は実測 OK）。制御は「空/エラー/不正 job_key で偽成功にしない」フェイルセーフ＋**位置参照時のみ** last_jobs+Code（§5）
+- [ ] **Agent ノードのループ挙動・コスト計測**（結果再投入の量）
+- [ ] routing を前段ルーターにする場合の **+1 LLM コスト**の許容
+- [ ] 整形/所感を Code テンプレにするか LLM にするか（コスト）
+
+> 共通の未解決（job_key 実装の JP 序数、しきい値・既定窓、エラーハンドリング、status 語彙マップ、システムプロンプト/ description 文面）は案1の 7・9 章と同じ。
+
+---
+
+## 11. データ取扱い方針（マスキング）
+
+> **背景**：ログを LLM(Gemini) に渡すと **データが Google 側へ出る**。特に **無料枠は入力/出力が学習・人間レビューに使われる**（規約で機密送付禁止）。→ **本番は課金ティア or Vertex AI（学習非利用）に切替**。その上で、以下を **LLM に渡す前（MCP 出口 or Code ノード）** にマスクする。**LLM にマスクさせない（決定論で処理）**。実装: [`masking/mask.py`](../masking/mask.py)。
+
+### 11.1 ソース別リスク（どこに出るか）
+
+| ソース | リスク |
+|---|---|
+| 構造化フィールド | 定型。`WindowsIdentity`（＝`DOMAIN\user`）だけ要注意 |
+| **Message（本文）** | **最大の未知数**。業務データ・パス・何でも入る |
+| 例外 / スタックトレース | パス・サーバ名・接続文字列・稀にデータ値 |
+| **カスタム項目（Add Log Fields）** | トランザクション実データ（顧客PII・金額）が入りうる |
+
+→ **P0 パターンは Message・カスタム項目にも必ず走らせる。**
+
+### 11.2 マスク対象（P0 必須 / P1 推奨 / P2 原則不要）
+
+- **P0（必須・除去）**：パスワード/シークレット/接続文字列、秘密鍵、マイナンバー(12桁)、クレカ(Luhn・下4桁)、口座番号(文脈語＋数字)、メール、電話、郵便番号＋住所、Windows ID/ユーザー名、**ファイルパス(Win/UNC)**
+- **P1（推奨・擬似化 or 除去・文脈依存）**：会社名/取引先/グループ会社(辞書)、ホスト名/マシン名/FQDN、ホストID(GUID)、IP、ロボット名、URL、顧客名(辞書 or NER)
+- **P2（原則そのまま・規程次第で判断）**：プロセス名、JobKey/JobId、フォルダ、ログレベル/時刻/実行時間、例外の型名（※例外の**本文**は P0 走査対象）
+
+### 11.3 方式・順序・勘所
+
+- **凡例**：除去＝`<TAG>` / 擬似化＝`<TAG:hash8>`（同値→同トークン・相関維持）/ 部分＝一部保持（パス→拡張子、カード→下4桁）
+- **擬似化推奨**：ホスト/マシン/ユーザー/IP/顧客 は擬似化 ＝「同一機・同一顧客の相関」を残して診断可能に
+- **処理順**（正規表現の食い合い防止）：①秘密鍵/接続文字列 → ②パス(UNC→Win) → ③URL/メール → ④ユーザー名 → ⑤公的ID・金融(文脈語付) → ⑥電話/郵便 → ⑦IP → ⑧マシンID(GUID、**JobKey除外**) → ⑨会社名辞書 → ⑩顧客名辞書
+- **allowlist（既定で未知削除）**：`mask_records` は未知フィールドを**削除**。許可フィールドは mask.py の `PASSTHROUGH_FIELDS`（Level/Timestamp/ProcessName/JobKey/State/ExceptionType…）が正。**残したい時は `drop_unknown=False`**（本文マスクして保持）
+- **誤検出注意**：口座・マイナンバーは「ただの数字」→ 文脈語併用。GUID は JobKey と区別（本文では GUID をマスクしない。マシンID はフィールド単位で擬似化）。パス抽出は空白で区切るため、スペースを含むパス（例 `C:\Program Files\…`）は途中までのマスクになる（v1許容）。ホスト名は `KNOWN_HOSTS` 辞書で検出（汎用検出はしない）
+- **巨大 Message は切り詰め**（既定 2000 字）
+- **実行場所**：**MCP 出口が最善**（PII が Dify/Gemini/履歴に一切入らない）。Dify Code ノードはサンドボックス制限に注意
+- **監査ログ**：`mask_records` が「何を何件マスクしたか」を logging（名 `mask`, INFO）にサマリ出力（**値は残さず件数のみ**）。マスクが効いているかの確認・監査に
+- **入れ子対応**：dict/list 値は**再帰的にマスク**（`_mask_value`）。カスタム項目に入れ子 JSON が来ても漏れない
+- **SALT 必須**：`MASK_SALT` 未設定だと既定の固定ソルトで動作し**警告ログ**を出す（擬似化が復元可能）。本番前に必ず設定
+- **要初期設定**：`GROUP_COMPANIES` / `CUSTOMER_NAMES` / `KNOWN_HOSTS` に実値、環境変数 `MASK_SALT` を設定
+
+### 11.5 既知の限界・未検証（v1）
+
+**テスト済み**：パスワード/シークレット・IP・電話・口座・カード(Luhn)・メール・郵便番号・Windows パス/UNC・Windows ID・入れ子再帰・allowlist — サンプルで動作確認済み。
+
+**未検証（要確認）**：
+- **UiPath 実ログでの検証**（フィールド構成・Message 形式が想定どおりか）
+- **会社名 / 顧客名 / ホスト名**：辞書（`GROUP_COMPANIES`/`CUSTOMER_NAMES`/`KNOWN_HOSTS`）に実値を入れての検出（空のうちは無効）
+- **入れ子データ**：実際のカスタム項目構造での再帰マスク
+- **マシン GUID** の実ログ中の出方
+
+**原理的な限界（割り切り）**：
+- **自由文の氏名**は正規表現では獲れない（NER か辞書が必要）
+- **ホスト名の汎用検出はしない**（誤検出が多いので辞書方式）
+- **本文中の GUID はマスクしない**（JobKey と判別不能。マシンID はフィールド単位で擬似化）
+- 口座/マイナンバーは数字列ゆえ**文脈語依存**（取りこぼし・過検出の可能性）
+
+→ 方針：**P0（確実に獲れる機微）を堅く、P1 は辞書とフィールド単位で補強、残差は受容しつつ本番は課金/Vertex で経路を担保**。
+
+### 11.6 テスト用 strict モード（全マスク）
+
+マスクの精度テストが済むまで、実ログで**フロー（routing/連鎖/状態）だけ**を安全に開発するための保険。
+
+- **有効化**：環境変数 `MASK_MODE=strict`（または `mask_records(..., strict=True)`）
+- **挙動**：自由文（Message 等）は**中身を見ず丸ごと `<REDACTED>`**、未知フィールドは**必ず破棄**、擬似化/allowlist はそのまま。**正規表現の精度に依存せず確実に漏らさない**
+- **フローへの影響**：routing はユーザー発話依存・連鎖は JobKey（保持）依存なので**影響なし**。ただし Agent の**最終回答の中身は空**になる（回答品質は測れない＝routing/連鎖/状態の確認用）
+- **ログ**：サマリに `mask summary [strict]` と出る（モード取り違え防止）
+- **本番前**：`MASK_MODE` を外して normal に戻し、normal マスクを実ログで検証すること
+
+---
+
+## 12. Agent プレイブック（プロンプト / description / 文脈）
+
+> **routing（弱点）＋ 指示語（memory OFF 対策）＋ フェイルセーフ** を1セットで入れる具体文面。Gemini 向け・コピペ可。まずこのまま Dify に入れてテスト → 混同が出た description だけ磨く。
+
+### 12.1 システムプロンプト（Agent ノードに設定）
+
+```text
+あなたは UiPath Orchestrator(OC) の「照会アシスタント」です。
+日本語の質問に対し、提供ツールを呼び出して、ジョブとログの"事実"を答えます。
+
+# 範囲
+- 仕事は「照会（取得して答える）」。原因推測・対策立案（調査）は範囲外。聞かれたら短く断る。
+- 必ずツールの結果だけに基づいて答える。推測で埋めない。記憶から答えない。
+- ジョブ/ログに関する依頼には、必ずいずれかのツールを呼ぶ。
+
+# ツールの使い分け（routing）
+- search_jobs：ジョブの【一覧】がほしい時。状態・期間・プロセス名で絞る。
+- search_logs：【特定の1ジョブ】のログ。job_key が必須。
+- analyze_historical_logs：【複数ジョブを横断】してキーワードで探す時（keyword必須・重い。1ジョブで済むなら使わない）。
+迷う時:「過去に何回／いつも落ちる?」など複数ジョブ→analyze_historical_logs。対象が1つに決まる「〜のログ」→search_logs。一覧/件数/状態だけ→search_jobs。
+
+# ログ取得の手順
+1. 対象の job_key が不明なら、まず search_jobs で特定（「直近/最も古い/失敗した」は search_jobs の並び替え・絞り込みで決める）。
+2. 得た job_key で search_logs を呼ぶ。
+3. job_key を自分で創作しない。必ずツール結果の値を使う。
+4. ログは必要分だけ：log_limit は控えめに。多い時は level / keyword で絞る（全件を取りに行かない）。
+
+# フェイルセーフ（失敗を隠さない）
+- ツールが「空・エラー・該当なし」を返したら、成功したふりをしない。
+  - 0件→「該当なし。期間やプロセス名を変えますか？」
+  - job_key無効/ログ空→「そのジョブのログが取得できませんでした。対象を選び直しますか？」
+- 対象を特定できない時は、推測実行せず、1つだけ短く聞き返す。
+
+# 文脈（指示語の解決）
+- 毎ターン入力の先頭に「現在の文脈」ブロックが与えられる。
+- 「このプロセス」「さっきの」「その」等は、この文脈ブロックで解決する。
+- 文脈に該当が無ければ、推測せず端的に聞き返す。
+
+# 日付・時刻
+- 日付計算は自分でしない。「今日」「直近7日」等はツールの相対パラメータ(days等)や与えられた範囲を使う。表示は日本時間(JST)。
+
+# 回答スタイル
+- まず結論（件数・状態・要点）、必要なら短い所感。ログ全文は貼らない。
+- データはマスク済み（<PATH> <COMPANY> 等のトークンはそのまま扱う）。
+```
+
+### 12.2 各ツールの description（MCP / Dify のツール説明欄に設定）
+
+```text
+search_jobs:
+ジョブの一覧を取得・特定する。状態・期間・プロセス名(ReleaseName)で絞り、新しい順等で並べる。
+「今日のジョブ」「失敗ジョブ一覧」「このプロセスの直近3件」などジョブ自体を探す時に使う。
+
+search_logs:
+指定した1つのジョブ(job_key)のログを取得する（ジョブ内をkeywordで絞るのも可）。
+job_key は search_jobs の結果から得る。特定ジョブのログ内容を見たい時に使う。
+
+analyze_historical_logs:
+あるプロセスの過去の複数ジョブを横断し、keyword一致ログを網羅検索する（keyword必須・重い）。
+「過去によく出るエラー」「以前も同じ事象があったか」など複数ジョブにまたがる時に使う。
+1ジョブで足りる時は search_logs を使う。
+```
+
+### 12.3 「現在の文脈」ブロック（毎ターン、ユーザー入力の先頭に差し込む）
+
+```text
+現在の文脈: プロセス={{ctx_process|なし}} / 直近ジョブ={{ctx_current_job_key|なし}} / 直近一覧={{last_jobs_summary|なし}}
+```
+
+Dify では「変数代入 → この文字列を組み立て → Agent ノード入力の先頭に連結」で実現（memory OFF でも指示語が解けるのが肝）。
+
+> **注入する変数は `ctx_process` / `ctx_current_job_key` / `last_jobs_summary` の3つだけ。** `last_jobs_summary` は会話変数 `last_jobs` から作る短い要約（件数＋先頭数件）。`pending_intent` / `pending_params` は**注入しない**（フロー制御専用・§13.1）。
+
+### 12.4 マスクの組み込み（1行）＋ 件数ログ
+
+```python
+from mask import mask_records   # mask.py は MCP と同じ場所に置く
+# search_logs / analyze_historical_logs がレコードを返す直前で:
+records, stats = mask_records(records)   # stats=Counter（例: PATH=3 EMAIL=1）
+return records
+```
+
+`mask_records` は「何を何件マスクしたか」を logging（logger 名 `mask`, INFO）にサマリ出力する（**値は残さず件数だけ**）。例: `mask summary: 6 masked over 3 record(s): EMAIL=1 PATH=3 WINID=2` — マスクが効いているかの監査に使える。
+
+---
+
+## 13. 会話状態のライフサイクル（保存 / 更新 / 破棄 / 注入）
+
+memory OFF のため、多ターンの文脈は**会話変数で明示管理**し、毎ターン Agent に**必要分だけ注入**する（§8・§12.3）。各変数の扱いを確定する。
+
+### 13.1 変数ごとのライフサイクル
+
+| 変数 | 何を持つ | set / update | clear | Agent への渡し方 |
+|---|---|---|---|---|
+| `last_jobs` | 直近 search_jobs 結果（JobKey 付き・要約） | search_jobs 実行後に上書き | 次の search_jobs で上書き（明示 clear 不要） | 存在すれば短い要約 `last_jobs_summary`（件数＋先頭）を「現在の文脈」に注入 |
+| `ctx_process` | 現在の対象プロセス名 | プロセスを名指し/一覧提示時に set、以後更新 | 別プロセスに切替で上書き | 毎ターン「現在の文脈」に注入 |
+| `ctx_current_job_key` | 「さっき/その」ジョブ | search_logs 対象が1つに定まった後に set | 別ジョブ参照で上書き | 毎ターン「現在の文脈」に注入 |
+| `pending_intent` | 聞き返し中の intent | 聞き返しを出す時に set | 回答で再開後 or 話題変更で clear | 注入しない（フロー制御用） |
+| `pending_params` | 聞き返し中の既抽出パラメータ | 同上 | 同上 | 回答マージ後にツール/Agent へ（注入はしない） |
+
+> **会話変数はこの5つ。** 「現在の文脈」に注入するのは `ctx_process` / `ctx_current_job_key` / `last_jobs_summary`（＝`last_jobs` の派生要約）の3つだけで、`pending_intent` / `pending_params` は注入しない（フロー制御専用）。
+
+### 13.2 聞き返し（pending）の状態遷移
+
+```mermaid
+flowchart TD
+  Idle["Idle（通常）"] -->|"情報不足→聞き返し(pending保存)"| Pending["Pending（聞き返し中）"]
+  Pending -->|"次発話=回答(paramsにマージ)"| Exec["実行→整形→Answer(clear)"]
+  Pending -->|"別話題/キャンセル(破棄)"| Idle
+  Exec --> Idle
+```
+
+- **保存**：情報不足で聞き返す瞬間に `pending_intent` と `pending_params`（抽出済みの値）を保存し、質問を Answer として返す（ターン終了）
+- **再開判定**：次ターン冒頭で「`pending_intent` があるか？」を判定。あり＆**発話が回答とみなせる**なら、回答を `pending_params` にマージして実行へ
+- **破棄**：`pending_intent` があっても**新発話が別 intent/別対象**なら pending を破棄して新規処理へ。「やっぱりいい」等のキャンセルも破棄
+- 再開/破棄の判定は軽い分類（LLM の intent 出力 or ルール）。迷うケースは「○○の件に戻りますか？」と一度だけ確認してよい
+
+### 13.3 日時処理（JST ⇄ UTC）の確定フロー
+
+1. **入力**：ユーザーは JST で言う（「今日」「昨日 10 時〜」）。**LLM に日付計算はさせない**
+2. **変換**：Code（or ツールの相対パラメータ）で JST→UTC（ISO 8601）に変換して MCP に渡す（例「今日」→ JST 00:00〜翌00:00 を UTC 化）
+3. **MCP**：UTC で返す
+4. **表示**：Code が UTC→JST(+9h) に戻して整形。LLM は整形後の値を見るだけ
+
+> 原則：**時刻の生成・計算は Code、LLM は受け取った値を説明するだけ**。TZ ずれと LLM の日付幻覚を同時に防ぐ。
+
+---
+
+*本書は案2（Function Calling）。案1は `照会アシスタントA_設計メモ.md`。まず「description を磨いて 1 Agent でテスト → 弱ければルーター追加」が案2の入り口。*
