@@ -44,6 +44,8 @@ if _SALT == _DEFAULT_SALT:
 # ── テスト用 strict モード（全マスク）──────────────────────────────
 # MASK_MODE=strict で、自由文フィールドは中身を見ずに丸ごと <REDACTED>、未知フィールドは必ず破棄。
 # マスク正規表現の精度に依存せず"確実に"漏らさない。フロー開発中に実ログを安全に流すための保険。
+# ※ MASK_MODE は Python プロセスに"エクスポート"されている必要がある。起動方法によっては env が
+#   引き継がれない → set -a / set +a で export してから起動する等（実測対応）。
 _STRICT = os.environ.get("MASK_MODE", "").strip().lower() in ("strict", "paranoid", "all")
 
 
@@ -192,11 +194,13 @@ def mask_text(text, counter=None):
 PASSTHROUGH_FIELDS = {
     "Level", "level", "Timestamp", "timeStamp", "TimeStamp",
     "ProcessName", "processName", "JobKey", "jobKey",
+    "Key", "key", "Id", "id",            # OC の戻り値の識別子（JobKey=Key / Id）。allowlist に無いと drop されて連鎖が壊れる（実測バグ）
     "State", "state", "ExceptionType",
 }
 # 自由文として本文マスクをかけるフィールド
 FREETEXT_FIELDS = {
     "Message", "message", "RawMessage", "rawMessage", "Details", "Exception",
+    "Info", "info",                      # 個人情報が入りうるので本文マスク対象に追加（実測対応）
 }
 # 擬似化するフィールド（相関を残す）: フィールド名 → タグ
 PSEUDO_FIELDS = {
@@ -303,7 +307,7 @@ if __name__ == "__main__":
 
     # 入れ子データ ＆ allowlist の挙動
     records = [
-        {"Level": "Error", "ProcessName": "InvoiceBot", "JobKey": "abc-123",
+        {"Level": "Error", "ProcessName": "InvoiceBot", "Key": "abc-123",
          "WindowsIdentity": r"CORP\t.yamada",
          "Message": r"fail on \\fs\グループ会社A\x.xlsx mail=foo@corp.co.jp",
          "Fields": {"customer_mail": "a@b.co.jp", "ips": ["10.0.0.1", "10.0.0.2"]}},

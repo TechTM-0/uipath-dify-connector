@@ -267,7 +267,7 @@ flowchart TD
 - **凡例**：除去＝`<TAG>` / 擬似化＝`<TAG:hash8>`（同値→同トークン・相関維持）/ 部分＝一部保持（パス→拡張子、カード→下4桁）
 - **擬似化推奨**：ホスト/マシン/ユーザー/IP/顧客 は擬似化 ＝「同一機・同一顧客の相関」を残して診断可能に
 - **処理順**（正規表現の食い合い防止）：①秘密鍵/接続文字列 → ②パス(UNC→Win) → ③URL/メール → ④ユーザー名 → ⑤公的ID・金融(文脈語付) → ⑥電話/郵便 → ⑦IP → ⑧マシンID(GUID、**JobKey除外**) → ⑨会社名辞書 → ⑩顧客名辞書
-- **allowlist（既定で未知削除）**：`mask_records` は未知フィールドを**削除**。許可フィールドは mask.py の `PASSTHROUGH_FIELDS`（Level/Timestamp/ProcessName/JobKey/State/ExceptionType…）が正。**残したい時は `drop_unknown=False`**（本文マスクして保持）
+- **allowlist（既定で未知削除）**：`mask_records` は未知フィールドを**削除**。許可フィールドは mask.py の `PASSTHROUGH_FIELDS`（Level/Timestamp/ProcessName/JobKey/**Key/Id**/State/ExceptionType…）が正。**残したい時は `drop_unknown=False`**（本文マスクして保持）。**⚠ OC は JobKey を `Key` 名で返す → 一次対策は MCP 側で `Key`→`jobKey` に正規化。安全網として `Key`/`Id` も allowlist 済み（無いと drop されて連鎖断・実測バグ）**
 - **誤検出注意**：口座・マイナンバーは「ただの数字」→ 文脈語併用。GUID は JobKey と区別（本文では GUID をマスクしない。マシンID はフィールド単位で擬似化）。パス抽出は空白で区切るため、スペースを含むパス（例 `C:\Program Files\…`）は途中までのマスクになる（v1許容）。ホスト名は `KNOWN_HOSTS` 辞書で検出（汎用検出はしない）
 - **巨大 Message は切り詰め**（既定 2000 字）
 - **実行場所**：**MCP 出口が最善**（PII が Dify/Gemini/履歴に一切入らない）。Dify Code ノードはサンドボックス制限に注意
@@ -281,7 +281,7 @@ flowchart TD
 **テスト済み**：パスワード/シークレット・IP・電話・口座・カード(Luhn)・メール・郵便番号・Windows パス/UNC・Windows ID・入れ子再帰・allowlist — サンプルで動作確認済み。
 
 **未検証（要確認）**：
-- **UiPath 実ログでの検証**（フィールド構成・Message 形式が想定どおりか）
+- **UiPath 実ログでの検証**（進行中・一部判明）：実測で **JobKey が `Key` 名で返り allowlist から drop → 連鎖断**のバグを発見・修正（`Key`/`Id` を allowlist 追加＋MCP 側で正規化）。**`Info` フィールドに PII 可能性 → 本文マスク対象に追加**
 - **会社名 / 顧客名 / ホスト名**：辞書（`GROUP_COMPANIES`/`CUSTOMER_NAMES`/`KNOWN_HOSTS`）に実値を入れての検出（空のうちは無効）
 - **入れ子データ**：実際のカスタム項目構造での再帰マスク
 - **マシン GUID** の実ログ中の出方
@@ -299,6 +299,7 @@ flowchart TD
 マスクの精度テストが済むまで、実ログで**フロー（routing/連鎖/状態）だけ**を安全に開発するための保険。
 
 - **有効化**：環境変数 `MASK_MODE=strict`（または `mask_records(..., strict=True)`）
+- **env の引き継ぎ注意**：`MASK_MODE` は Python プロセスにエクスポートが必要。起動方法次第で env が渡らない → `set -a` / `set +a` で export してから起動（実測対応）
 - **挙動**：自由文（Message 等）は**中身を見ず丸ごと `<REDACTED>`**、未知フィールドは**必ず破棄**、擬似化/allowlist はそのまま。**正規表現の精度に依存せず確実に漏らさない**
 - **フローへの影響**：routing はユーザー発話依存・連鎖は JobKey（保持）依存なので**影響なし**。ただし Agent の**最終回答の中身は空**になる（回答品質は測れない＝routing/連鎖/状態の確認用）
 - **ログ**：サマリに `mask summary [strict]` と出る（モード取り違え防止）
